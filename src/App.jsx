@@ -4,6 +4,7 @@ import {
   collection, addDoc, updateDoc, deleteDoc, doc, onSnapshot, query, where
 } from "firebase/firestore";
 import { signInWithPopup, signOut, onAuthStateChanged } from "firebase/auth";
+import { BrowserMultiFormatReader, NotFoundException } from "@zxing/browser";
 
 // ─── API: Open Library ───
 async function lookupOpenLibrary(isbn) {
@@ -44,9 +45,9 @@ async function lookupISBN(isbn) {
 }
 
 // ─── API: BoardGameGeek ───
-async function searchBGG(query) {
+async function searchBGG(queryStr) {
   try {
-    const r = await fetch(`https://boardgamegeek.com/xmlapi2/search?query=${encodeURIComponent(query)}&type=boardgame`);
+    const r = await fetch(`https://boardgamegeek.com/xmlapi2/search?query=${encodeURIComponent(queryStr)}&type=boardgame`);
     const txt = await r.text(); const p = new DOMParser(); const xml = p.parseFromString(txt, "text/xml");
     const items = xml.querySelectorAll("item"); if (!items.length) return null;
     const id = items[0].getAttribute("id");
@@ -54,7 +55,7 @@ async function searchBGG(query) {
     const dt = await dr.text(); const dx = p.parseFromString(dt, "text/xml"); const it = dx.querySelector("item");
     if (!it) return null;
     return {
-      title: it.querySelector("name[type='primary']")?.getAttribute("value") || query,
+      title: it.querySelector("name[type='primary']")?.getAttribute("value") || queryStr,
       year: it.querySelector("yearpublished")?.getAttribute("value") || "",
       minPlayers: it.querySelector("minplayers")?.getAttribute("value") || "",
       maxPlayers: it.querySelector("maxplayers")?.getAttribute("value") || "",
@@ -67,7 +68,7 @@ async function searchBGG(query) {
   } catch { return null; }
 }
 
-// ─── Classification helpers ───
+// ─── Classification ───
 function isISBN(code) { return code && (code.startsWith("978") || code.startsWith("979")) && code.length === 13; }
 const COMIC_KW = ["comic", "comics", "manga", "graphic novel", "fumett", "bande dessinée", "marvel", "dc comics", "bonelli", "panini comics", "star comics", "j-pop", "planet manga", "dynit"];
 const RPG_KW = ["role-playing", "roleplaying", "rpg", "gioco di ruolo", "gdr", "dungeons", "d&d", "pathfinder"];
@@ -142,8 +143,8 @@ export default function App() {
   const [detailItem, setDetailItem] = useState(null);
   const [seriesView, setSeriesView] = useState(false);
   const videoRef = useRef(null);
-  const streamRef = useRef(null);
-  const scanIntRef = useRef(null);
+  const readerRef = useRef(null);
+  const scanningRef = useRef(false);
 
   // ─── Auth ───
   useEffect(() => {
@@ -153,7 +154,7 @@ export default function App() {
   const login = () => signInWithPopup(auth, googleProvider);
   const logout = () => signOut(auth);
 
-  // ─── Firestore realtime sync ───
+  // ─── Firestore sync ───
   useEffect(() => {
     if (!user) { setItems([]); return; }
     const q = query(collection(db, "items"), where("uid", "==", user.uid));
@@ -171,44 +172,74 @@ export default function App() {
     await addDoc(collection(db, "items"), { ...data, uid: user.uid });
     setEditItem(null); setManualEntry(null); setScanStatus("✓ Aggiunto!");
   };
-
   const updateItem = async (item) => {
     const { id, ...data } = item;
     await updateDoc(doc(db, "items", id), data);
     setDetailItem(item);
   };
-
   const deleteItem = async (id) => {
     await deleteDoc(doc(db, "items", id));
     setDetailItem(null);
   };
 
-  // ─── Scanner ───
+  // ─── ZXing Scanner ───
   const stopScan = useCallback(() => {
-    if (scanIntRef.current) clearInterval(scanIntRef.current);
-    if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
-    streamRef.current = null; setScanning(false);
+    scanningRef.current = false;
+    if (readerRef.current) {
+      try { readerRef.current.reset(); } catch {}
+      readerRef.current = null;
+    }
+    // Stop camera stream
+    if (videoRef.current && videoRef.current.srcObject) {
+      videoRef.current.srcObject.getTracks().forEach(t => t.stop());
+      videoRef.current.srcObject = null;
+    }
+    setScanning(false);
   }, []);
 
   const startScan = useCallback(async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
-      streamRef.current = stream;
-      if (videoRef.current) { videoRef.current.srcObject = stream; await videoRef.current.play(); }
-      setScanning(true); setScanStatus("Inquadra il barcode...");
-      if ("BarcodeDetector" in window) {
-        const det = new BarcodeDetector({ formats: ["ean_13", "ean_8", "upc_a", "upc_e", "code_128"] });
-        scanIntRef.current = setInterval(async () => {
-          if (!videoRef.current || videoRef.current.readyState !== 4) return;
-          try {
-            const bc = await det.detect(videoRef.current);
-            if (bc.length) { stopScan(); handleBarcode(bc[0].rawValue); }
-          } catch {}
-        }, 300);
-      } else {
-        setScanStatus("BarcodeDetector non supportato in questo browser. Usa l'inserimento manuale.");
+      setScanStatus("Avvio fotocamera...");
+      setScanning(true);
+      scanningRef.current = true;
+
+      const reader = new BrowserMultiFormatReader();
+      readerRef.current = reader;
+
+      // Get rear camera
+      const devices = await BrowserMultiFormatReader.listVideoInputDevices();
+      const rearCamera = devices.find(d =>
+        d.label.toLowerCase().includes("back") ||
+        d.label.toLowerCase().includes("rear") ||
+        d.label.toLowerCase().includes("posteriore") ||
+        d.label.toLowerCase().includes("environment")
+      ) || devices[devices.length - 1] || devices[0];
+
+      if (!rearCamera) {
+        setScanStatus("Nessuna fotocamera trovata.");
+        setScanning(false);
+        return;
       }
-    } catch (err) { setScanStatus("Errore fotocamera: " + err.message); }
+
+      setScanStatus("Inquadra il barcode...");
+
+      await reader.decodeFromVideoDevice(
+        rearCamera.deviceId,
+        videoRef.current,
+        (result, error) => {
+          if (!scanningRef.current) return;
+          if (result) {
+            const code = result.getText();
+            stopScan();
+            handleBarcode(code);
+          }
+          // NotFoundException is normal (no barcode in frame yet), ignore it
+        }
+      );
+    } catch (err) {
+      setScanStatus("Errore fotocamera: " + err.message);
+      setScanning(false);
+    }
   }, [stopScan]);
 
   useEffect(() => () => stopScan(), [stopScan]);
@@ -219,30 +250,30 @@ export default function App() {
     setLookupLoading(true);
     const isbn = isISBN(code);
     setScanStatus(isbn ? `ISBN: ${code} — Ricerca...` : `EAN: ${code} — Ricerca...`);
-    if (isbn) {
-      const data = await lookupISBN(code);
-      if (data) {
-        const tp = detectType(data.subjects, data.title, data.publisher);
-        const genre = detectGenre(data.subjects, [], tp);
-        const vn = extractVolume(data.title);
-        setEditItem({ id: "_new", type: tp, barcode: code, title: data.title, author: data.author || "", cover: data.cover || "", year: data.year || "", genre, publisher: data.publisher || "", series: vn ? extractSeries(data.title) : "", volumeNumber: vn || "", totalVolumes: "", notes: "", addedAt: new Date().toISOString() });
-        setScanStatus(`✓ ${data.source}: ${data.title}`);
-      } else {
-        setManualEntry({ type: "libro", barcode: code });
-        setScanStatus("Non trovato. Inserisci manualmente.");
-      }
+
+    const buildItem = (data, code) => {
+      const tp = detectType(data.subjects || [], data.title, data.publisher || "");
+      const genre = detectGenre(data.subjects || [], [], tp);
+      const vn = extractVolume(data.title);
+      return {
+        id: "_new", type: tp, barcode: code,
+        title: data.title, author: data.author || "", cover: data.cover || "",
+        year: data.year || "", genre, publisher: data.publisher || "",
+        series: vn ? extractSeries(data.title) : "", volumeNumber: vn || "",
+        totalVolumes: "", notes: "", addedAt: new Date().toISOString()
+      };
+    };
+
+    const data = await lookupISBN(code);
+    if (data) {
+      setEditItem(buildItem(data, code));
+      setScanStatus(`✓ ${data.source}: ${data.title}`);
+    } else if (isbn) {
+      setManualEntry({ type: "libro", barcode: code });
+      setScanStatus("Non trovato. Inserisci manualmente.");
     } else {
-      const data = await lookupISBN(code);
-      if (data) {
-        const tp = detectType(data.subjects, data.title, data.publisher);
-        const genre = detectGenre(data.subjects, [], tp);
-        const vn = extractVolume(data.title);
-        setEditItem({ id: "_new", type: tp, barcode: code, title: data.title, author: data.author || "", cover: data.cover || "", year: data.year || "", genre, publisher: data.publisher || "", series: vn ? extractSeries(data.title) : "", volumeNumber: vn || "", totalVolumes: "", notes: "", addedAt: new Date().toISOString() });
-        setScanStatus(`✓ Trovato: ${data.title}`);
-      } else {
-        setManualEntry({ type: "gioco", barcode: code });
-        setScanStatus("EAN non ISBN — probabilmente un gioco. Cerca su BGG.");
-      }
+      setManualEntry({ type: "gioco", barcode: code });
+      setScanStatus("EAN non ISBN — probabilmente un gioco. Cerca su BGG.");
     }
     setLookupLoading(false);
   };
@@ -261,52 +292,22 @@ export default function App() {
 
   const createBlank = (type) => ({ id: "_new", type, barcode: manualEntry?.barcode || "", title: "", author: "", designer: "", cover: "", year: "", genre: "Altro", publisher: "", series: "", volumeNumber: "", totalVolumes: "", minPlayers: "", maxPlayers: "", playingTime: "", rating: "", notes: "", addedAt: new Date().toISOString() });
 
-  // ─── Derived data ───
-  const counts = {
-    libro: items.filter(i => i.type === "libro").length,
-    gioco: items.filter(i => i.type === "gioco").length,
-    fumetto: items.filter(i => i.type === "fumetto").length
-  };
-
-  const searchResults = searchQuery.trim()
-    ? items.filter(i => {
-        const q = searchQuery.toLowerCase();
-        return i.title?.toLowerCase().includes(q)
-          || (i.author || i.designer || "").toLowerCase().includes(q)
-          || (i.genre || "").toLowerCase().includes(q)
-          || (i.series || "").toLowerCase().includes(q);
-      })
-    : [];
+  // ─── Derived ───
+  const counts = { libro: items.filter(i => i.type === "libro").length, gioco: items.filter(i => i.type === "gioco").length, fumetto: items.filter(i => i.type === "fumetto").length };
+  const searchResults = searchQuery.trim() ? items.filter(i => { const q = searchQuery.toLowerCase(); return i.title?.toLowerCase().includes(q) || (i.author || i.designer || "").toLowerCase().includes(q) || (i.genre || "").toLowerCase().includes(q) || (i.series || "").toLowerCase().includes(q); }) : [];
 
   const comicSeries = (() => {
     const cs = items.filter(i => i.type === "fumetto" && i.series);
     const m = {};
-    cs.forEach(c => {
-      const k = c.series.toLowerCase().trim();
-      if (!m[k]) m[k] = { name: c.series, items: [], totalVolumes: 0, cover: null };
-      m[k].items.push(c);
-      if (c.cover && !m[k].cover) m[k].cover = c.cover;
-      const tv = parseInt(c.totalVolumes);
-      if (tv > m[k].totalVolumes) m[k].totalVolumes = tv;
-    });
+    cs.forEach(c => { const k = c.series.toLowerCase().trim(); if (!m[k]) m[k] = { name: c.series, items: [], totalVolumes: 0, cover: null }; m[k].items.push(c); if (c.cover && !m[k].cover) m[k].cover = c.cover; const tv = parseInt(c.totalVolumes); if (tv > m[k].totalVolumes) m[k].totalVolumes = tv; });
     Object.values(m).forEach(s => s.items.sort((a, b) => (parseInt(a.volumeNumber) || 0) - (parseInt(b.volumeNumber) || 0)));
     return m;
   })();
 
-  const getMissing = (s) => {
-    if (!s.totalVolumes) return [];
-    const owned = new Set(s.items.map(i => parseInt(i.volumeNumber)).filter(Boolean));
-    const m = [];
-    for (let i = 1; i <= s.totalVolumes; i++) if (!owned.has(i)) m.push(i);
-    return m;
-  };
+  const getMissing = (s) => { if (!s.totalVolumes) return []; const owned = new Set(s.items.map(i => parseInt(i.volumeNumber)).filter(Boolean)); const m = []; for (let i = 1; i <= s.totalVolumes; i++) if (!owned.has(i)) m.push(i); return m; };
 
   // ─── Login screen ───
-  if (authLoading) return (
-    <div style={{ background: C.bg, height: "100vh", display: "flex", alignItems: "center", justifyContent: "center", color: C.text, fontFamily: FB }}>
-      <p>Caricamento...</p>
-    </div>
-  );
+  if (authLoading) return <div style={{ background: C.bg, height: "100vh", display: "flex", alignItems: "center", justifyContent: "center", color: C.text, fontFamily: FB }}>Caricamento...</div>;
 
   if (!user) return (
     <div style={{ background: C.bg, minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", fontFamily: FB, padding: 24 }}>
@@ -347,13 +348,7 @@ export default function App() {
 
       {/* Tabs */}
       <div style={{ display: "flex", borderBottom: `1px solid ${C.border}`, background: C.surface, overflowX: "auto" }}>
-        {[
-          { id: "scan", l: "📷 Scan" },
-          { id: "search", l: "🔍 Cerca" },
-          { id: "libri", l: "📚 Libri" },
-          { id: "fumetti", l: "📖 Fumetti" },
-          { id: "giochi", l: "🎲 Giochi" }
-        ].map(t => (
+        {[{ id: "scan", l: "📷 Scan" }, { id: "search", l: "🔍 Cerca" }, { id: "libri", l: "📚 Libri" }, { id: "fumetti", l: "📖 Fumetti" }, { id: "giochi", l: "🎲 Giochi" }].map(t => (
           <button key={t.id} onClick={() => { setTab(t.id); if (t.id !== "scan") stopScan(); }}
             style={{ flex: "0 0 auto", padding: "10px 12px", border: "none", cursor: "pointer", whiteSpace: "nowrap", background: tab === t.id ? C.bg : "transparent", color: tab === t.id ? C.accent : C.textDim, fontFamily: FB, fontSize: 12.5, fontWeight: tab === t.id ? 700 : 500, borderBottom: tab === t.id ? `2px solid ${C.accent}` : "2px solid transparent" }}>
             {t.l}
@@ -370,19 +365,30 @@ export default function App() {
             {!scanning && (
               <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12 }}>
                 <div style={{ fontSize: 48, opacity: 0.25 }}>📷</div>
-                <button onClick={startScan} style={{ background: C.accent, color: C.bg, border: "none", borderRadius: 8, padding: "12px 28px", fontSize: 15, fontWeight: 700, cursor: "pointer", fontFamily: FB }}>Avvia Scanner</button>
+                <button onClick={startScan} style={{ background: C.accent, color: C.bg, border: "none", borderRadius: 8, padding: "12px 28px", fontSize: 15, fontWeight: 700, cursor: "pointer", fontFamily: FB }}>
+                  Avvia Scanner
+                </button>
               </div>
             )}
             {scanning && (
-              <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
-                <div style={{ width: "70%", height: 3, background: C.accent, opacity: 0.8, boxShadow: `0 0 20px ${C.accent}`, animation: "sl 2s ease-in-out infinite" }} />
-              </div>
+              <>
+                {/* Scan overlay frame */}
+                <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
+                  <div style={{ width: "72%", height: "30%", border: `2px solid ${C.accent}`, borderRadius: 8, boxShadow: `0 0 0 2000px rgba(0,0,0,0.45)` }} />
+                </div>
+                {/* Scan line */}
+                <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none", overflow: "hidden" }}>
+                  <div style={{ width: "72%", height: 2, background: C.accent, opacity: 0.9, boxShadow: `0 0 12px ${C.accent}`, animation: "sl 2s ease-in-out infinite" }} />
+                </div>
+              </>
             )}
           </div>
-          <style>{`@keyframes sl{0%,100%{transform:translateY(-60px)}50%{transform:translateY(60px)}}`}</style>
+          <style>{`@keyframes sl{0%,100%{transform:translateY(-50px)}50%{transform:translateY(50px)}}`}</style>
 
           {scanning && (
-            <button onClick={stopScan} style={{ width: "100%", padding: 10, borderRadius: 8, border: `1px solid ${C.border}`, background: C.surface, color: C.text, cursor: "pointer", marginBottom: 12, fontFamily: FB, fontSize: 13 }}>⏹ Ferma</button>
+            <button onClick={stopScan} style={{ width: "100%", padding: 10, borderRadius: 8, border: `1px solid ${C.border}`, background: C.surface, color: C.text, cursor: "pointer", marginBottom: 12, fontFamily: FB, fontSize: 13 }}>
+              ⏹ Ferma scanner
+            </button>
           )}
 
           <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
@@ -428,8 +434,7 @@ export default function App() {
 
         {/* ═══ SEARCH ═══ */}
         {tab === "search" && (<div>
-          <input value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
-            placeholder="Cerca per titolo, autore, serie, genere..." autoFocus
+          <input value={searchQuery} onChange={e => setSearchQuery(e.target.value)} placeholder="Cerca per titolo, autore, serie, genere..." autoFocus
             style={{ ...inputBase, padding: "12px 14px", fontSize: 15, marginBottom: 4 }} />
           {searchQuery.trim() && searchResults.length > 0 && (
             <div style={{ background: C.surface, borderRadius: 10, border: `1px solid ${C.border}`, maxHeight: 500, overflowY: "auto", marginTop: 4 }}>
@@ -453,60 +458,43 @@ export default function App() {
           {!searchQuery.trim() && <p style={{ textAlign: "center", color: C.textDim, marginTop: 40 }}>Inizia a digitare per cercare</p>}
         </div>)}
 
-        {/* ═══ BOOKS ═══ */}
         {tab === "libri" && <ItemGrid items={items.filter(i => i.type === "libro")} type="libro" onSelect={setDetailItem} />}
 
-        {/* ═══ COMICS ═══ */}
         {tab === "fumetti" && (<div>
           <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
             <button onClick={() => setSeriesView(false)} style={{ padding: "6px 14px", borderRadius: 20, border: "none", cursor: "pointer", background: !seriesView ? C.fumetto : C.surface, color: !seriesView ? "#fff" : C.textDim, fontSize: 12, fontWeight: 600, fontFamily: FB }}>Tutti</button>
             <button onClick={() => setSeriesView(true)} style={{ padding: "6px 14px", borderRadius: 20, border: "none", cursor: "pointer", background: seriesView ? C.fumetto : C.surface, color: seriesView ? "#fff" : C.textDim, fontSize: 12, fontWeight: 600, fontFamily: FB }}>Per serie</button>
           </div>
-          {!seriesView
-            ? <ItemGrid items={items.filter(i => i.type === "fumetto")} type="fumetto" onSelect={setDetailItem} />
-            : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {Object.keys(comicSeries).length === 0 && <p style={{ textAlign: "center", color: C.textDim, marginTop: 30 }}>Nessuna serie. Aggiungi fumetti con il campo "Serie".</p>}
-                {Object.values(comicSeries).map(s => {
-                  const miss = getMissing(s);
-                  return (
-                    <div key={s.name} style={{ background: C.card, borderRadius: 10, border: `1px solid ${C.border}` }}>
-                      <div style={{ display: "flex", gap: 12, padding: 12 }}>
-                        {s.cover && <img src={s.cover} alt="" style={{ width: 50, height: 68, objectFit: "cover", borderRadius: 6 }} />}
-                        <div style={{ flex: 1 }}>
-                          <h3 style={{ margin: 0, fontSize: 15, fontWeight: 700, fontFamily: FD, color: C.fumetto }}>{s.name}</h3>
-                          <p style={{ margin: "4px 0 0", fontSize: 12, color: C.textDim }}>{s.items.length} vol.{s.totalVolumes ? ` su ${s.totalVolumes}` : ""}</p>
-                          {s.totalVolumes > 0 && (
-                            <div style={{ marginTop: 6, height: 4, borderRadius: 2, background: C.border, overflow: "hidden" }}>
-                              <div style={{ height: "100%", borderRadius: 2, background: C.fumetto, width: `${Math.min(100, (s.items.length / s.totalVolumes) * 100)}%` }} />
-                            </div>
-                          )}
-                          {miss.length > 0 && miss.length <= 20 && <p style={{ margin: "6px 0 0", fontSize: 11, color: C.red }}>Mancanti: {miss.join(", ")}</p>}
-                          {miss.length > 20 && <p style={{ margin: "6px 0 0", fontSize: 11, color: C.red }}>{miss.length} volumi mancanti</p>}
-                        </div>
-                      </div>
-                      <div style={{ padding: "0 12px 12px", display: "flex", flexWrap: "wrap", gap: 4 }}>
-                        {s.items.map(v => (
-                          <span key={v.id} onClick={() => setDetailItem(v)}
-                            style={{ padding: "3px 8px", borderRadius: 4, fontSize: 11, fontWeight: 600, background: `${C.fumetto}25`, color: C.fumetto, cursor: "pointer" }}>
-                            #{v.volumeNumber || "?"}
-                          </span>
-                        ))}
+          {!seriesView ? <ItemGrid items={items.filter(i => i.type === "fumetto")} type="fumetto" onSelect={setDetailItem} /> : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {Object.keys(comicSeries).length === 0 && <p style={{ textAlign: "center", color: C.textDim, marginTop: 30 }}>Nessuna serie. Aggiungi fumetti con il campo "Serie".</p>}
+              {Object.values(comicSeries).map(s => {
+                const miss = getMissing(s);
+                return (
+                  <div key={s.name} style={{ background: C.card, borderRadius: 10, border: `1px solid ${C.border}` }}>
+                    <div style={{ display: "flex", gap: 12, padding: 12 }}>
+                      {s.cover && <img src={s.cover} alt="" style={{ width: 50, height: 68, objectFit: "cover", borderRadius: 6 }} />}
+                      <div style={{ flex: 1 }}>
+                        <h3 style={{ margin: 0, fontSize: 15, fontWeight: 700, fontFamily: FD, color: C.fumetto }}>{s.name}</h3>
+                        <p style={{ margin: "4px 0 0", fontSize: 12, color: C.textDim }}>{s.items.length} vol.{s.totalVolumes ? ` su ${s.totalVolumes}` : ""}</p>
+                        {s.totalVolumes > 0 && <div style={{ marginTop: 6, height: 4, borderRadius: 2, background: C.border, overflow: "hidden" }}>
+                          <div style={{ height: "100%", borderRadius: 2, background: C.fumetto, width: `${Math.min(100, (s.items.length / s.totalVolumes) * 100)}%` }} />
+                        </div>}
+                        {miss.length > 0 && miss.length <= 20 && <p style={{ margin: "6px 0 0", fontSize: 11, color: C.red }}>Mancanti: {miss.join(", ")}</p>}
+                        {miss.length > 20 && <p style={{ margin: "6px 0 0", fontSize: 11, color: C.red }}>{miss.length} volumi mancanti</p>}
                       </div>
                     </div>
-                  );
-                })}
-                {(() => {
-                  const st = items.filter(i => i.type === "fumetto" && !i.series);
-                  if (!st.length) return null;
-                  return <div style={{ marginTop: 8 }}><h4 style={{ fontSize: 13, color: C.textDim, margin: "0 0 8px" }}>Senza serie</h4><ItemGrid items={st} type="fumetto" onSelect={setDetailItem} /></div>;
-                })()}
-              </div>
-            )
-          }
+                    <div style={{ padding: "0 12px 12px", display: "flex", flexWrap: "wrap", gap: 4 }}>
+                      {s.items.map(v => <span key={v.id} onClick={() => setDetailItem(v)} style={{ padding: "3px 8px", borderRadius: 4, fontSize: 11, fontWeight: 600, background: `${C.fumetto}25`, color: C.fumetto, cursor: "pointer" }}>#{v.volumeNumber || "?"}</span>)}
+                    </div>
+                  </div>
+                );
+              })}
+              {(() => { const st = items.filter(i => i.type === "fumetto" && !i.series); if (!st.length) return null; return <div style={{ marginTop: 8 }}><h4 style={{ fontSize: 13, color: C.textDim, margin: "0 0 8px" }}>Senza serie</h4><ItemGrid items={st} type="fumetto" onSelect={setDetailItem} /></div>; })()}
+            </div>
+          )}
         </div>)}
 
-        {/* ═══ GAMES ═══ */}
         {tab === "giochi" && <ItemGrid items={items.filter(i => i.type === "gioco")} type="gioco" onSelect={setDetailItem} />}
       </div>
 
@@ -524,41 +512,26 @@ function ItemGrid({ items, type, onSelect }) {
   return (
     <div>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 12 }}>
-        {genres.map(g => (
-          <button key={g} onClick={() => setFilter(g)}
-            style={{ padding: "4px 11px", borderRadius: 16, border: "none", cursor: "pointer", background: filter === g ? tc : C.surface, color: filter === g ? "#fff" : C.textDim, fontSize: 11, fontWeight: 600, fontFamily: FB }}>
-            {g}
-          </button>
-        ))}
+        {genres.map(g => <button key={g} onClick={() => setFilter(g)} style={{ padding: "4px 11px", borderRadius: 16, border: "none", cursor: "pointer", background: filter === g ? tc : C.surface, color: filter === g ? "#fff" : C.textDim, fontSize: 11, fontWeight: 600, fontFamily: FB }}>{g}</button>)}
       </div>
-      {!filtered.length
-        ? <p style={{ textAlign: "center", color: C.textDim, marginTop: 30 }}>{!items.length ? "Nessun elemento. Scansiona!" : "Nessun risultato."}</p>
-        : (
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(130px, 1fr))", gap: 10 }}>
-            {filtered.map(it => (
-              <div key={it.id} onClick={() => onSelect(it)}
-                style={{ background: C.card, borderRadius: 10, overflow: "hidden", cursor: "pointer", border: `1px solid ${C.border}`, transition: "transform 0.15s" }}
-                onMouseEnter={e => e.currentTarget.style.transform = "translateY(-2px)"}
-                onMouseLeave={e => e.currentTarget.style.transform = ""}>
-                <div style={{ aspectRatio: "3/4", background: C.surface, display: "flex", alignItems: "center", justifyContent: "center", position: "relative" }}>
-                  {it.cover
-                    ? <img src={it.cover} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-                    : <span style={{ fontSize: 32, opacity: 0.2 }}>{typeIcon(type)}</span>}
-                  {it.volumeNumber && (
-                    <span style={{ position: "absolute", top: 4, right: 4, background: C.fumetto, color: "#fff", fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4 }}>
-                      #{it.volumeNumber}
-                    </span>
-                  )}
-                </div>
-                <div style={{ padding: "7px 9px" }}>
-                  <div style={{ fontSize: 11.5, fontWeight: 700, lineHeight: 1.3, marginBottom: 2, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{it.title || "Senza titolo"}</div>
-                  <div style={{ fontSize: 10, color: C.textDim, marginBottom: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{it.author || it.designer || it.series || ""}</div>
-                  <span style={{ fontSize: 9, fontWeight: 700, padding: "1px 5px", borderRadius: 3, background: `${C.accent}18`, color: C.accent }}>{it.genre}</span>
-                </div>
+      {!filtered.length ? <p style={{ textAlign: "center", color: C.textDim, marginTop: 30 }}>{!items.length ? "Nessun elemento. Scansiona!" : "Nessun risultato."}</p> : (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(130px, 1fr))", gap: 10 }}>
+          {filtered.map(it => (
+            <div key={it.id} onClick={() => onSelect(it)} style={{ background: C.card, borderRadius: 10, overflow: "hidden", cursor: "pointer", border: `1px solid ${C.border}`, transition: "transform 0.15s" }}
+              onMouseEnter={e => e.currentTarget.style.transform = "translateY(-2px)"} onMouseLeave={e => e.currentTarget.style.transform = ""}>
+              <div style={{ aspectRatio: "3/4", background: C.surface, display: "flex", alignItems: "center", justifyContent: "center", position: "relative" }}>
+                {it.cover ? <img src={it.cover} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : <span style={{ fontSize: 32, opacity: 0.2 }}>{typeIcon(type)}</span>}
+                {it.volumeNumber && <span style={{ position: "absolute", top: 4, right: 4, background: C.fumetto, color: "#fff", fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4 }}>#{it.volumeNumber}</span>}
               </div>
-            ))}
-          </div>
-        )}
+              <div style={{ padding: "7px 9px" }}>
+                <div style={{ fontSize: 11.5, fontWeight: 700, lineHeight: 1.3, marginBottom: 2, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{it.title || "Senza titolo"}</div>
+                <div style={{ fontSize: 10, color: C.textDim, marginBottom: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{it.author || it.designer || it.series || ""}</div>
+                <span style={{ fontSize: 9, fontWeight: 700, padding: "1px 5px", borderRadius: 3, background: `${C.accent}18`, color: C.accent }}>{it.genre}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -568,12 +541,7 @@ function EditForm({ item, onSave, onCancel }) {
   const [d, setD] = useState({ ...item });
   const s = (k, v) => setD(p => ({ ...p, [k]: v }));
   const tc = typeColor(d.type);
-  const go = d.type === "libro"
-    ? ["GdR", "Fantasy", "Sci-Fi", "Horror", "Narrativa", "Saggistica", "Manuale", "Altro"]
-    : d.type === "fumetto"
-    ? ["Manga", "Supereroi", "GdR", "Fantasy", "Sci-Fi", "Horror", "Fumetto", "Graphic Novel", "Altro"]
-    : ["GdR", "Strategia", "Fantasy", "Sci-Fi", "Horror", "Party Game", "Cooperativo", "Bambini", "Altro"];
-
+  const go = d.type === "libro" ? ["GdR", "Fantasy", "Sci-Fi", "Horror", "Narrativa", "Saggistica", "Manuale", "Altro"] : d.type === "fumetto" ? ["Manga", "Supereroi", "GdR", "Fantasy", "Sci-Fi", "Horror", "Fumetto", "Graphic Novel", "Altro"] : ["GdR", "Strategia", "Fantasy", "Sci-Fi", "Horror", "Party Game", "Cooperativo", "Bambini", "Altro"];
   return (
     <div style={{ padding: 14, borderRadius: 10, background: C.surface, border: `1px solid ${tc}35`, marginBottom: 12 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
@@ -581,10 +549,7 @@ function EditForm({ item, onSave, onCancel }) {
         <div>
           <div style={{ display: "flex", gap: 4, marginBottom: 4 }}>
             {["libro", "fumetto", "gioco"].map(t => (
-              <button key={t} onClick={() => s("type", t)}
-                style={{ padding: "2px 8px", borderRadius: 4, border: "none", cursor: "pointer", fontSize: 10, fontWeight: 700, background: d.type === t ? `${typeColor(t)}30` : "transparent", color: d.type === t ? typeColor(t) : C.textDim, fontFamily: FB }}>
-                {typeLabel(t)}
-              </button>
+              <button key={t} onClick={() => s("type", t)} style={{ padding: "2px 8px", borderRadius: 4, border: "none", cursor: "pointer", fontSize: 10, fontWeight: 700, background: d.type === t ? `${typeColor(t)}30` : "transparent", color: d.type === t ? typeColor(t) : C.textDim, fontFamily: FB }}>{typeLabel(t)}</button>
             ))}
           </div>
           {d.barcode && <div style={{ fontSize: 10, color: C.textDim }}>Codice: {d.barcode}</div>}
@@ -595,37 +560,25 @@ function EditForm({ item, onSave, onCancel }) {
         {(d.type === "libro" || d.type === "fumetto") && <input value={d.author || ""} onChange={e => s("author", e.target.value)} placeholder="Autore" style={inputBase} />}
         {d.type === "gioco" && <input value={d.designer || ""} onChange={e => s("designer", e.target.value)} placeholder="Designer" style={inputBase} />}
         {(d.type === "libro" || d.type === "fumetto") && <input value={d.publisher || ""} onChange={e => s("publisher", e.target.value)} placeholder="Editore" style={inputBase} />}
-        {d.type === "fumetto" && (
-          <div style={{ display: "flex", gap: 6 }}>
-            <input value={d.series || ""} onChange={e => s("series", e.target.value)} placeholder="Serie (es. One Piece)" style={{ ...inputBase, flex: 2 }} />
-            <input value={d.volumeNumber || ""} onChange={e => s("volumeNumber", e.target.value)} placeholder="N°" style={{ ...inputBase, flex: 1 }} type="number" />
-            <input value={d.totalVolumes || ""} onChange={e => s("totalVolumes", e.target.value)} placeholder="Tot." style={{ ...inputBase, flex: 1 }} type="number" />
-          </div>
-        )}
-        {d.type === "gioco" && (
-          <div style={{ display: "flex", gap: 6 }}>
-            <input value={d.minPlayers || ""} onChange={e => s("minPlayers", e.target.value)} placeholder="Min" style={{ ...inputBase, flex: 1 }} />
-            <input value={d.maxPlayers || ""} onChange={e => s("maxPlayers", e.target.value)} placeholder="Max" style={{ ...inputBase, flex: 1 }} />
-            <input value={d.playingTime || ""} onChange={e => s("playingTime", e.target.value)} placeholder="Min." style={{ ...inputBase, flex: 1 }} />
-          </div>
-        )}
+        {d.type === "fumetto" && <div style={{ display: "flex", gap: 6 }}>
+          <input value={d.series || ""} onChange={e => s("series", e.target.value)} placeholder="Serie (es. One Piece)" style={{ ...inputBase, flex: 2 }} />
+          <input value={d.volumeNumber || ""} onChange={e => s("volumeNumber", e.target.value)} placeholder="N°" style={{ ...inputBase, flex: 1 }} type="number" />
+          <input value={d.totalVolumes || ""} onChange={e => s("totalVolumes", e.target.value)} placeholder="Tot." style={{ ...inputBase, flex: 1 }} type="number" />
+        </div>}
+        {d.type === "gioco" && <div style={{ display: "flex", gap: 6 }}>
+          <input value={d.minPlayers || ""} onChange={e => s("minPlayers", e.target.value)} placeholder="Min" style={{ ...inputBase, flex: 1 }} />
+          <input value={d.maxPlayers || ""} onChange={e => s("maxPlayers", e.target.value)} placeholder="Max" style={{ ...inputBase, flex: 1 }} />
+          <input value={d.playingTime || ""} onChange={e => s("playingTime", e.target.value)} placeholder="Min." style={{ ...inputBase, flex: 1 }} />
+        </div>}
         <div style={{ display: "flex", gap: 6 }}>
           <input value={d.year || ""} onChange={e => s("year", e.target.value)} placeholder="Anno" style={{ ...inputBase, flex: 1 }} />
-          <select value={d.genre} onChange={e => s("genre", e.target.value)} style={{ ...inputBase, flex: 1, cursor: "pointer" }}>
-            {go.map(g => <option key={g} value={g}>{g}</option>)}
-          </select>
+          <select value={d.genre} onChange={e => s("genre", e.target.value)} style={{ ...inputBase, flex: 1, cursor: "pointer" }}>{go.map(g => <option key={g} value={g}>{g}</option>)}</select>
         </div>
         <textarea value={d.notes || ""} onChange={e => s("notes", e.target.value)} placeholder="Note..." rows={2} style={{ ...inputBase, resize: "vertical" }} />
       </div>
       <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-        <button onClick={() => onSave(d)} disabled={!d.title.trim()}
-          style={{ flex: 1, padding: 10, borderRadius: 8, border: "none", background: d.title.trim() ? C.green : C.border, color: d.title.trim() ? C.bg : C.textDim, fontWeight: 700, cursor: d.title.trim() ? "pointer" : "not-allowed", fontFamily: FB, fontSize: 14 }}>
-          ✓ Salva
-        </button>
-        <button onClick={onCancel}
-          style={{ padding: "10px 16px", borderRadius: 8, border: `1px solid ${C.border}`, background: "transparent", color: C.textDim, cursor: "pointer", fontFamily: FB, fontSize: 14 }}>
-          Annulla
-        </button>
+        <button onClick={() => onSave(d)} disabled={!d.title.trim()} style={{ flex: 1, padding: 10, borderRadius: 8, border: "none", background: d.title.trim() ? C.green : C.border, color: d.title.trim() ? C.bg : C.textDim, fontWeight: 700, cursor: d.title.trim() ? "pointer" : "not-allowed", fontFamily: FB, fontSize: 14 }}>✓ Salva</button>
+        <button onClick={onCancel} style={{ padding: "10px 16px", borderRadius: 8, border: `1px solid ${C.border}`, background: "transparent", color: C.textDim, cursor: "pointer", fontFamily: FB, fontSize: 14 }}>Annulla</button>
       </div>
     </div>
   );
@@ -637,12 +590,7 @@ function DetailModal({ item, onClose, onDelete, onUpdate }) {
   const [d, setD] = useState({ ...item });
   const s = (k, v) => setD(p => ({ ...p, [k]: v }));
   const tc = typeColor(item.type);
-  const go = item.type === "libro"
-    ? ["GdR", "Fantasy", "Sci-Fi", "Horror", "Narrativa", "Saggistica", "Manuale", "Altro"]
-    : item.type === "fumetto"
-    ? ["Manga", "Supereroi", "GdR", "Fantasy", "Sci-Fi", "Horror", "Fumetto", "Graphic Novel", "Altro"]
-    : ["GdR", "Strategia", "Fantasy", "Sci-Fi", "Horror", "Party Game", "Cooperativo", "Bambini", "Altro"];
-
+  const go = item.type === "libro" ? ["GdR", "Fantasy", "Sci-Fi", "Horror", "Narrativa", "Saggistica", "Manuale", "Altro"] : item.type === "fumetto" ? ["Manga", "Supereroi", "GdR", "Fantasy", "Sci-Fi", "Horror", "Fumetto", "Graphic Novel", "Altro"] : ["GdR", "Strategia", "Fantasy", "Sci-Fi", "Horror", "Party Game", "Cooperativo", "Bambini", "Altro"];
   return (
     <div style={{ position: "fixed", inset: 0, zIndex: 200, background: "rgba(0,0,0,0.8)", display: "flex", alignItems: "flex-end", justifyContent: "center" }} onClick={onClose}>
       <div style={{ width: "100%", maxWidth: 520, maxHeight: "88vh", overflowY: "auto", background: C.bg, borderRadius: "20px 20px 0 0", padding: 20 }} onClick={e => e.stopPropagation()}>
@@ -650,11 +598,7 @@ function DetailModal({ item, onClose, onDelete, onUpdate }) {
           <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 4, background: `${tc}25`, color: tc }}>{typeIcon(item.type)} {typeLabel(item.type)}</span>
           <button onClick={onClose} style={{ background: "none", border: "none", color: C.textDim, cursor: "pointer", fontSize: 18 }}>✕</button>
         </div>
-        {item.cover && (
-          <div style={{ textAlign: "center", marginBottom: 14 }}>
-            <img src={item.cover} alt="" style={{ maxHeight: 180, borderRadius: 8, boxShadow: "0 4px 20px rgba(0,0,0,0.4)" }} />
-          </div>
-        )}
+        {item.cover && <div style={{ textAlign: "center", marginBottom: 14 }}><img src={item.cover} alt="" style={{ maxHeight: 180, borderRadius: 8, boxShadow: "0 4px 20px rgba(0,0,0,0.4)" }} /></div>}
         {!editing ? (<>
           <h2 style={{ fontFamily: FD, fontSize: 20, fontWeight: 700, margin: "0 0 4px", color: C.text }}>{item.title}</h2>
           <p style={{ margin: "0 0 10px", color: C.textDim, fontSize: 13 }}>{item.author || item.designer || ""}{item.year ? ` · ${item.year}` : ""}</p>
@@ -670,10 +614,8 @@ function DetailModal({ item, onClose, onDelete, onUpdate }) {
           {item.barcode && <p style={{ fontSize: 11, color: C.textDim, margin: "0 0 3px" }}>Codice: {item.barcode}</p>}
           {item.notes && <p style={{ fontSize: 13, color: C.text, margin: "10px 0 0", padding: 10, background: C.surface, borderRadius: 6 }}>{item.notes}</p>}
           <div style={{ display: "flex", gap: 8, marginTop: 18 }}>
-            <button onClick={() => { setD({ ...item }); setEditing(true); }}
-              style={{ flex: 1, padding: 10, borderRadius: 8, border: `1px solid ${tc}`, background: "transparent", color: tc, fontWeight: 600, cursor: "pointer", fontFamily: FB, fontSize: 13 }}>✏️ Modifica</button>
-            <button onClick={() => { if (window.confirm("Eliminare?")) onDelete(item.id); }}
-              style={{ padding: "10px 16px", borderRadius: 8, border: `1px solid ${C.red}40`, background: "transparent", color: C.red, fontWeight: 600, cursor: "pointer", fontFamily: FB, fontSize: 13 }}>🗑</button>
+            <button onClick={() => { setD({ ...item }); setEditing(true); }} style={{ flex: 1, padding: 10, borderRadius: 8, border: `1px solid ${tc}`, background: "transparent", color: tc, fontWeight: 600, cursor: "pointer", fontFamily: FB, fontSize: 13 }}>✏️ Modifica</button>
+            <button onClick={() => { if (window.confirm("Eliminare?")) onDelete(item.id); }} style={{ padding: "10px 16px", borderRadius: 8, border: `1px solid ${C.red}40`, background: "transparent", color: C.red, fontWeight: 600, cursor: "pointer", fontFamily: FB, fontSize: 13 }}>🗑</button>
           </div>
         </>) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
@@ -681,32 +623,24 @@ function DetailModal({ item, onClose, onDelete, onUpdate }) {
             {(d.type === "libro" || d.type === "fumetto") && <input value={d.author || ""} onChange={e => s("author", e.target.value)} placeholder="Autore" style={inputBase} />}
             {d.type === "gioco" && <input value={d.designer || ""} onChange={e => s("designer", e.target.value)} placeholder="Designer" style={inputBase} />}
             {(d.type === "libro" || d.type === "fumetto") && <input value={d.publisher || ""} onChange={e => s("publisher", e.target.value)} placeholder="Editore" style={inputBase} />}
-            {d.type === "fumetto" && (
-              <div style={{ display: "flex", gap: 6 }}>
-                <input value={d.series || ""} onChange={e => s("series", e.target.value)} placeholder="Serie" style={{ ...inputBase, flex: 2 }} />
-                <input value={d.volumeNumber || ""} onChange={e => s("volumeNumber", e.target.value)} placeholder="N°" style={{ ...inputBase, flex: 1 }} type="number" />
-                <input value={d.totalVolumes || ""} onChange={e => s("totalVolumes", e.target.value)} placeholder="Tot." style={{ ...inputBase, flex: 1 }} type="number" />
-              </div>
-            )}
-            {d.type === "gioco" && (
-              <div style={{ display: "flex", gap: 6 }}>
-                <input value={d.minPlayers || ""} onChange={e => s("minPlayers", e.target.value)} placeholder="Min" style={{ ...inputBase, flex: 1 }} />
-                <input value={d.maxPlayers || ""} onChange={e => s("maxPlayers", e.target.value)} placeholder="Max" style={{ ...inputBase, flex: 1 }} />
-                <input value={d.playingTime || ""} onChange={e => s("playingTime", e.target.value)} placeholder="Min." style={{ ...inputBase, flex: 1 }} />
-              </div>
-            )}
+            {d.type === "fumetto" && <div style={{ display: "flex", gap: 6 }}>
+              <input value={d.series || ""} onChange={e => s("series", e.target.value)} placeholder="Serie" style={{ ...inputBase, flex: 2 }} />
+              <input value={d.volumeNumber || ""} onChange={e => s("volumeNumber", e.target.value)} placeholder="N°" style={{ ...inputBase, flex: 1 }} type="number" />
+              <input value={d.totalVolumes || ""} onChange={e => s("totalVolumes", e.target.value)} placeholder="Tot." style={{ ...inputBase, flex: 1 }} type="number" />
+            </div>}
+            {d.type === "gioco" && <div style={{ display: "flex", gap: 6 }}>
+              <input value={d.minPlayers || ""} onChange={e => s("minPlayers", e.target.value)} placeholder="Min" style={{ ...inputBase, flex: 1 }} />
+              <input value={d.maxPlayers || ""} onChange={e => s("maxPlayers", e.target.value)} placeholder="Max" style={{ ...inputBase, flex: 1 }} />
+              <input value={d.playingTime || ""} onChange={e => s("playingTime", e.target.value)} placeholder="Min." style={{ ...inputBase, flex: 1 }} />
+            </div>}
             <div style={{ display: "flex", gap: 6 }}>
               <input value={d.year || ""} onChange={e => s("year", e.target.value)} placeholder="Anno" style={{ ...inputBase, flex: 1 }} />
-              <select value={d.genre} onChange={e => s("genre", e.target.value)} style={{ ...inputBase, flex: 1, cursor: "pointer" }}>
-                {go.map(g => <option key={g} value={g}>{g}</option>)}
-              </select>
+              <select value={d.genre} onChange={e => s("genre", e.target.value)} style={{ ...inputBase, flex: 1, cursor: "pointer" }}>{go.map(g => <option key={g} value={g}>{g}</option>)}</select>
             </div>
             <textarea value={d.notes || ""} onChange={e => s("notes", e.target.value)} placeholder="Note..." rows={2} style={{ ...inputBase, resize: "vertical" }} />
             <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
-              <button onClick={() => { onUpdate(d); setEditing(false); }}
-                style={{ flex: 1, padding: 10, borderRadius: 8, border: "none", background: C.green, color: C.bg, fontWeight: 700, cursor: "pointer", fontFamily: FB, fontSize: 13 }}>✓ Salva</button>
-              <button onClick={() => setEditing(false)}
-                style={{ padding: "10px 16px", borderRadius: 8, border: `1px solid ${C.border}`, background: "transparent", color: C.textDim, cursor: "pointer", fontFamily: FB, fontSize: 13 }}>Annulla</button>
+              <button onClick={() => { onUpdate(d); setEditing(false); }} style={{ flex: 1, padding: 10, borderRadius: 8, border: "none", background: C.green, color: C.bg, fontWeight: 700, cursor: "pointer", fontFamily: FB, fontSize: 13 }}>✓ Salva</button>
+              <button onClick={() => setEditing(false)} style={{ padding: "10px 16px", borderRadius: 8, border: `1px solid ${C.border}`, background: "transparent", color: C.textDim, cursor: "pointer", fontFamily: FB, fontSize: 13 }}>Annulla</button>
             </div>
           </div>
         )}
