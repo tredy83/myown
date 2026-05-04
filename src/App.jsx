@@ -44,14 +44,15 @@ async function lookupISBN(isbn) {
   return data;
 }
 
-// ─── API: BoardGameGeek ───
+// ─── API: BoardGameGeek (via CORS proxy) ───
 async function searchBGG(queryStr) {
   try {
-    const r = await fetch(`https://boardgamegeek.com/xmlapi2/search?query=${encodeURIComponent(queryStr)}&type=boardgame`);
+    const PROXY = "https://corsproxy.io/?";
+    const r = await fetch(PROXY + encodeURIComponent(`https://boardgamegeek.com/xmlapi2/search?query=${encodeURIComponent(queryStr)}&type=boardgame`));
     const txt = await r.text(); const p = new DOMParser(); const xml = p.parseFromString(txt, "text/xml");
     const items = xml.querySelectorAll("item"); if (!items.length) return null;
     const id = items[0].getAttribute("id");
-    const dr = await fetch(`https://boardgamegeek.com/xmlapi2/thing?id=${id}&stats=1`);
+    const dr = await fetch(PROXY + encodeURIComponent(`https://boardgamegeek.com/xmlapi2/thing?id=${id}&stats=1`));
     const dt = await dr.text(); const dx = p.parseFromString(dt, "text/xml"); const it = dx.querySelector("item");
     if (!it) return null;
     return {
