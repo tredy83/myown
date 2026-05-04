@@ -244,8 +244,13 @@ export default function App() {
               <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",pointerEvents:"none"}}>
                 <div style={{position:"relative",width:"68%",height:"36%"}}>
                   <div style={{position:"absolute",inset:0,borderRadius:12,boxShadow:"0 0 0 9999px rgba(0,0,0,0.5)"}}/>
-                  {[{t:0,l:0,bt:"top",bl:"left"},{t:0,r:0,bt:"top",bl:"right"},{b:0,l:0,bt:"bottom",bl:"left"},{b:0,r:0,bt:"bottom",bl:"right"}].map((pos,i)=>(
-                    <div key={i} style={{position:"absolute",width:22,height:22,...(pos.t!==undefined?{top:0}:{}),(pos.b!==undefined?{bottom:0}:{}),(pos.l!==undefined?{left:0}:{}),(pos.r!==undefined?{right:0}:{}),[`border${pos.bt.charAt(0).toUpperCase()+pos.bt.slice(1)}`]:"3px solid var(--accent)",[`border${pos.bl.charAt(0).toUpperCase()+pos.bl.slice(1)}`]:"3px solid var(--accent)",borderRadius:pos.bt==="top"&&pos.bl==="left"?"8px 0 0 0":pos.bt==="top"&&pos.bl==="right"?"0 8px 0 0":pos.bt==="bottom"&&pos.bl==="left"?"0 0 0 8px":"0 0 8px 0"}}/>
+                  {[
+                    {top:0,left:0,borderTop:"3px solid var(--accent)",borderLeft:"3px solid var(--accent)",borderRadius:"8px 0 0 0"},
+                    {top:0,right:0,borderTop:"3px solid var(--accent)",borderRight:"3px solid var(--accent)",borderRadius:"0 8px 0 0"},
+                    {bottom:0,left:0,borderBottom:"3px solid var(--accent)",borderLeft:"3px solid var(--accent)",borderRadius:"0 0 0 8px"},
+                    {bottom:0,right:0,borderBottom:"3px solid var(--accent)",borderRight:"3px solid var(--accent)",borderRadius:"0 0 8px 0"},
+                  ].map((corner,i)=>(
+                    <div key={i} style={{position:"absolute",width:22,height:22,...corner}}/>
                   ))}
                   <div style={{position:"absolute",left:4,right:4,top:"50%",height:2,background:"linear-gradient(90deg,transparent,var(--accent),transparent)",animation:"scanLine 2s ease-in-out infinite"}}/>
                 </div>
