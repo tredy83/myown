@@ -49,7 +49,7 @@ async function lookupGoogleBooks(isbn) {
 async function lookupISBN(isbn) { return (await lookupOpenLibrary(isbn)) || (await lookupGoogleBooks(isbn)); }
 async function searchBGG(q) {
   try {
-    const P = "https://corsproxy.io/?";
+    const P = "https://bgg-proxy.tredy83.workers.dev/?url=";
     const r = await fetch(P+encodeURIComponent(`https://boardgamegeek.com/xmlapi2/search?query=${encodeURIComponent(q)}&type=boardgame`));
     const txt = await r.text(); const p = new DOMParser(); const xml = p.parseFromString(txt,"text/xml");
     const its = xml.querySelectorAll("item"); if (!its.length) return null;
