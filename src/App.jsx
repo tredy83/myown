@@ -48,16 +48,50 @@ async function lookupGoogleBooks(isbn) {
 }
 async function lookupISBN(isbn) { return (await lookupOpenLibrary(isbn)) || (await lookupGoogleBooks(isbn)); }
 async function searchBGG(q) {
+  // Try Google Books first - works without CORS issues
   try {
-    const P = "https://bgg-proxy.tredy83.workers.dev/?url=";
-    const r = await fetch(P+encodeURIComponent(`https://boardgamegeek.com/xmlapi2/search?query=${encodeURIComponent(q)}&type=boardgame`));
-    const txt = await r.text(); const p = new DOMParser(); const xml = p.parseFromString(txt,"text/xml");
-    const its = xml.querySelectorAll("item"); if (!its.length) return null;
-    const id = its[0].getAttribute("id");
-    const dr = await fetch(P+encodeURIComponent(`https://boardgamegeek.com/xmlapi2/thing?id=${id}&stats=1`));
-    const dt = await dr.text(); const dx = p.parseFromString(dt,"text/xml"); const it = dx.querySelector("item"); if (!it) return null;
-    return { title: it.querySelector("name[type='primary']")?.getAttribute("value")||q, year: it.querySelector("yearpublished")?.getAttribute("value")||"", minPlayers: it.querySelector("minplayers")?.getAttribute("value")||"", maxPlayers: it.querySelector("maxplayers")?.getAttribute("value")||"", playingTime: it.querySelector("playingtime")?.getAttribute("value")||"", image: it.querySelector("image")?.textContent||null, categories:[...it.querySelectorAll('link[type="boardgamecategory"]')].map(l=>l.getAttribute("value")), designer:[...it.querySelectorAll('link[type="boardgamedesigner"]')].map(l=>l.getAttribute("value")).join(", "), rating: it.querySelector("statistics ratings average")?.getAttribute("value")||"" };
-  } catch { return null; }
+    const r = await fetch(`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q+' board game')}&maxResults=5`);
+    const d = await r.json();
+    if (d.items?.length) {
+      // Find best match - prefer results with board game keywords
+      const item = d.items.find(i => {
+        const cats = (i.volumeInfo.categories||[]).join(' ').toLowerCase();
+        const title = (i.volumeInfo.title||'').toLowerCase();
+        return cats.includes('game') || cats.includes('gioc') || title.includes('game');
+      }) || d.items[0];
+      const v = item.volumeInfo;
+      return {
+        title: v.title||q,
+        designer: (v.authors||[]).join(', '),
+        cover: v.imageLinks?.thumbnail||v.imageLinks?.smallThumbnail||null,
+        year: v.publishedDate||'',
+        categories: v.categories||[],
+        minPlayers: '', maxPlayers: '', playingTime: '', rating: '',
+        source: 'GoogleBooks'
+      };
+    }
+  } catch {}
+
+  // Fallback: Open Library search
+  try {
+    const r = await fetch(`https://openlibrary.org/search.json?q=${encodeURIComponent(q)}&subject=board+games&limit=1`);
+    const d = await r.json();
+    if (d.docs?.length) {
+      const doc = d.docs[0];
+      const coverId = doc.cover_i;
+      return {
+        title: doc.title||q,
+        designer: (doc.author_name||[]).join(', '),
+        cover: coverId ? `https://covers.openlibrary.org/b/id/${coverId}-M.jpg` : null,
+        year: doc.first_publish_year?.toString()||'',
+        categories: doc.subject?.slice(0,3)||[],
+        minPlayers: '', maxPlayers: '', playingTime: '', rating: '',
+        source: 'OpenLibrary'
+      };
+    }
+  } catch {}
+
+  return null;
 }
 
 function isISBN(c) { return c&&(c.startsWith("978")||c.startsWith("979"))&&c.length===13; }
